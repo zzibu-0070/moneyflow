@@ -2,12 +2,15 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+import ssl
+
+# SSL 인증서 문제 해결 (Mac 사용자 필수)
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # [1] 페이지 설정
-st.set_page_config(layout="wide", page_title="자금 흐름 분석기", page_icon="💰")
+st.set_page_config(layout="wide", page_title="자금 흐름 분석기 v2.2", page_icon="💰")
 
-# [2] 포트폴리오 프로필 (기존 데이터 유지)
+# [2] 포트폴리오 프로필 (변수 정의를 상단에 배치)
 MY_PORTFOLIO = {
     "청팀 - 미래섹터": {
         "양자컴퓨터": ["IONQ", "QBTS", "RGTI"],
@@ -46,103 +49,105 @@ MY_PORTFOLIO = {
 }
 
 # --------------------------------------------------------------------------
-# [3] 데이터 엔진: 시가총액 합산 및 지수 산출
+# [3] 데이터 엔진: 시총 합산 및 수익률 역산
 # --------------------------------------------------------------------------
 
 @st.cache_data(ttl=86400)
-def get_shares_map_robust(tickers):
-    mapping = {}
+def get_shares_and_info(tickers):
+    data = {}
     for t in tickers:
         try:
             tk = yf.Ticker(t)
-            s = tk.fast_info.get('shares_outstanding')
-            if not s: s = tk.info.get('sharesOutstanding', 0)
-            mapping[t] = s if s else 0
-        except: mapping[t] = 0
-    return mapping
+            mcap = tk.info.get('marketCap')
+            if not mcap:
+                s = tk.fast_info.get('shares_outstanding')
+                p = tk.fast_info.get('last_price')
+                mcap = s * p if s and p else 0
+            data[t] = mcap
+        except: data[t] = 0
+    return data
 
 @st.cache_data(ttl=3600)
-def get_team_mcap_index_data(period_str):
+def get_robust_mcap_data(period_str):
+    # MY_PORTFOLIO가 함수 내에서 정상적으로 접근되도록 함
     blue_tickers = list(set([t for sub in MY_PORTFOLIO["청팀 - 미래섹터"].values() for t in sub]))
     white_tickers = list(set([t for sub in MY_PORTFOLIO["백팀 - 자금의 안전금고"].values() for t in sub]))
     all_tickers = list(set(blue_tickers + white_tickers))
     
-    shares = get_shares_map_robust(all_tickers)
-    raw_data = yf.download(all_tickers, period=period_str, interval="1d", group_by='ticker')
+    # 환율 데이터 수집
+    fx = yf.download(["USDKRW=X", "USDJPY=X"], period=period_str)['Close']
     
-    if raw_data.empty: return pd.DataFrame()
-
-    mcap_results = pd.DataFrame(index=raw_data.index)
+    # 가격 데이터 수집
+    raw_data = yf.download(all_tickers, period=period_str)['Close']
+    if raw_data.empty: return pd.DataFrame(), {}
     
-    # 각 팀별 단순 시총 합계(Sum of Market Cap) 산출
+    current_mcaps = get_shares_and_info(all_tickers)
+    mcap_history = pd.DataFrame(index=raw_data.index)
+    
     for team_name, team_tickers in [('Blue Team', blue_tickers), ('White Team', white_tickers)]:
-        team_total_mcap = pd.Series(0.0, index=raw_data.index)
+        team_sum = pd.Series(0.0, index=raw_data.index)
         for t in team_tickers:
-            try:
-                if t in raw_data.columns.levels[0]:
-                    # (개별 종목 종가 * 발행주식수)를 팀 합계에 누적
-                    team_total_mcap += raw_data[t]['Close'].ffill().fillna(0) * shares.get(t, 0)
-            except: continue
-        mcap_results[team_name] = team_total_mcap
-
-    # 휴장일(시총 합계가 0인 날) 제거
-    final_df = mcap_results[(mcap_results['Blue Team'] > 0) & (mcap_results['White Team'] > 0)].dropna()
-    return final_df
+            if t in raw_data.columns:
+                series = raw_data[t].ffill()
+                current_p = series.iloc[-1]
+                if current_p > 0:
+                    mcap_usd = current_mcaps.get(t, 0)
+                    if t.endswith('.KS'):
+                        mcap_usd = mcap_usd / fx['USDKRW=X'].iloc[-1]
+                    elif t.endswith('.T'):
+                        mcap_usd = mcap_usd / fx['USDJPY=X'].iloc[-1]
+                        
+                    # 현재 시총에서 과거 주가 비율만큼 역산
+                    team_sum += mcap_usd * (series / current_p)
+        mcap_history[team_name] = team_sum
+        
+    return mcap_history.replace(0, pd.NA).dropna(), current_mcaps
 
 # --------------------------------------------------------------------------
-# [4] UI 및 그래프 출력
+# [4] UI 출력 및 그래프
 # --------------------------------------------------------------------------
 
-st.title("💰 팀별 자금 흐름 분석기")
-st.caption("시작일의 팀별 전체 시가총액 합계를 '100'으로 설정하여 자금의 규모 변화를 추적합니다.")
+st.title("💰 팀별 자금 규모 및 지수 분석기")
+st.caption("백팀(공룡주)과 청팀(중소형 미래주)의 자금 규모 차이를 반영하여 지수화합니다.")
 
 period_choice = st.selectbox("분석 기간 선택", ["1개월", "3개월", "6개월"])
 period_map = {"1개월": "1mo", "3개월": "3mo", "6개월": "6mo"}
 
-with st.spinner(f'{period_choice}간의 자금 흐름을 분석 중입니다...'):
-    mcap_history = get_team_mcap_index_data(period_map[period_choice])
+mcap_history, current_mcaps = get_robust_mcap_data(period_map[period_choice])
 
 if not mcap_history.empty:
-    # 지수 산출: (현재 시총 합계 / 시작일 시총 합계) * 100
+    # 지수 산출 (시작일 = 100)
     index_df = (mcap_history / mcap_history.iloc[0]) * 100
     
-    # 상단 지표
-    b_start_val, b_end_val = mcap_history['Blue Team'].iloc[0], mcap_history['Blue Team'].iloc[-1]
-    w_start_val, w_end_val = mcap_history['White Team'].iloc[0], mcap_history['White Team'].iloc[-1]
+    # 상단 메트릭
+    b_val = mcap_history['Blue Team'].iloc[-1]
+    w_val = mcap_history['White Team'].iloc[-1]
     
-    m1, m2 = st.columns(2)
-    m1.metric("청팀 전체 시총 규모", f"${b_end_val/1e12:.2f}T", f"{((b_end_val/b_start_val)-1)*100:+.2f}%")
-    m2.metric("백팀 전체 시총 규모", f"${w_end_val/1e12:.2f}T", f"{((w_end_val/w_start_val)-1)*100:+.2f}%")
+    col1, col2 = st.columns(2)
+    col1.metric("청팀(미래) 총 시총 규모", f"${b_val/1e12:.2f}T", f"{index_df['Blue Team'].iloc[-1]-100:+.2f}%")
+    col2.metric("백팀(안전) 총 시총 규모", f"${w_val/1e12:.2f}T", f"{index_df['White Team'].iloc[-1]-100:+.2f}%")
 
-    # 그래프 생성 (시총 변화 지수)
+    # 그래프
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=index_df.index, y=index_df['Blue Team'], name="청팀 자금지수", line=dict(color='#ef5350', width=3)))
+    fig.add_trace(go.Scatter(x=index_df.index, y=index_df['White Team'], name="백팀 자금지수", line=dict(color='#42a5f5', width=3)))
+    fig.add_hline(y=100, line_dash="dash", line_color="gray")
     
-    # 민감도 확대 (1.5배 줌인) 로직
-    all_vals = pd.concat([index_df['Blue Team'], index_df['White Team']])
-    v_diff, v_mid = all_vals.max() - all_vals.min(), (all_vals.max() + all_vals.min()) / 2
-    y_range = [v_mid - (v_diff * 0.75), v_mid + (v_diff * 0.75)] if v_diff > 0 else None
-
-    fig.add_trace(go.Scatter(x=index_df.index, y=index_df['Blue Team'], name='청팀 자금지수', line=dict(color='#ef5350', width=4)))
-    fig.add_trace(go.Scatter(x=index_df.index, y=index_df['White Team'], name='백팀 자금지수', line=dict(color='#42a5f5', width=4)))
-
     fig.update_layout(
-        title=f"팀별 시가총액 합계 변화 (시작일 {index_df.index[0].strftime('%Y-%m-%d')} = 100)",
-        yaxis_title="시총 변화 지수",
-        yaxis_range=y_range,
-        template="plotly_white",
+        title=f"자금 흐름 지수 (시작일 {index_df.index[0].date()} = 100)",
+        yaxis_title="변화 지수",
         hovermode="x unified",
-        height=600,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        template="plotly_white",
+        height=600
     )
-    
     st.plotly_chart(fig, use_container_width=True)
 
-    st.info("""
-    **💡 지수 산출 방식 안내 (자금 이동 파악용)**
-    * **기준점:** 선택한 기간의 첫 거래일의 '팀별 모든 종목 시총 합계'를 **100**으로 고정합니다.
-    * **추적:** 매일 변화하는 '팀별 모든 종목 시총 합계'를 기준점과 비교하여 지수화합니다.
-    * **의미:** 종목별 단순 수익률 평균이 아니라, **실제 거대 자본(시가총액)이 어느 팀에서 더 크게 팽창하거나 수축하고 있는지**를 보여줍니다.
-    """)
+    # 데이터 검증용 테이블
+    with st.expander("🔍 데이터 검증: 팀별 시총 TOP 10 종목"):
+        check_df = pd.DataFrame.from_dict(current_mcaps, orient='index', columns=['Market Cap (USD)'])
+        check_df['Billion $'] = check_df['Market Cap (USD)'] / 1e9
+        st.write("백팀은 조 단위(Trillion) 기업들이 많아 시총 합계가 훨씬 크게 나타나는 것이 정상입니다.")
+        st.dataframe(check_df.sort_values(by='Market Cap (USD)', ascending=False).head(20))
 
 else:
-    st.error("데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
+    st.error("데이터 로딩 중입니다. 잠시만 기다려주세요.")
